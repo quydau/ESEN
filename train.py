@@ -245,18 +245,16 @@ def main():
                 model, train_loader, optimizer, device
             )
             
-            # Evaluate on dev
+            # Evaluate on dev only
             dev_results = evaluate(model, dev_loader, device)
-            
-            # Evaluate on test (for tracking)
-            test_results = evaluate(model, test_loader, device)
             
             # Print progress every 5 epochs
             if (epoch + 1) % 5 == 0:
                 print(f"\nEpoch {epoch+1}:")
                 print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | F1-Ma: {train_f1_macro:.4f}")
                 print(f"Dev   - Loss: {dev_results['loss']:.4f} | Acc: {dev_results['accuracy']:.4f} | F1-Ma: {dev_results['f1_macro']:.4f}")
-                print(f"Test  - Loss: {test_results['loss']:.4f} | Acc: {test_results['accuracy']:.4f} | F1-Ma: {test_results['f1_macro']:.4f}")
+                print("\nDev Classification Report:")
+                print(dev_results['report_str'])
             
             # Early stopping check on dev F1-Macro
             current_dev_f1 = dev_results['f1_macro']
