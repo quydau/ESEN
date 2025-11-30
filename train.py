@@ -7,9 +7,12 @@ from models.esen import ESEN, compute_loss
 from utils.preprocessing import ESENDataPreprocessor
 from models.graph_constructor import GraphConstructor
 import json
+import pickle
+import os
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 import numpy as np
+from multiprocessing import Pool, cpu_count
 
 def get_device():
     if torch.cuda.is_available():
@@ -45,49 +48,97 @@ def move_batch_to_device(batch, device):
     
     return move_dict(batch, device)
 
+def _process_sample(args):
+    """Helper function for parallel preprocessing"""
+    key, sample, window_size, stanza_cache_dir = args
+    
+    # Create instances for each worker
+    graph_constructor = GraphConstructor(window_size=window_size, cache_dir=stanza_cache_dir)
+    preprocessor = ESENDataPreprocessor(embedding_dim=300)
+    
+    graphs = graph_constructor.process_claim_evidence(
+        claim=sample['claim_text'],
+        evidences=sample['evidences']
+    )
+    
+    prepared = preprocessor.prepare_sample(graphs)
+    
+    # Binary label
+    label_lower = sample['cred_label'].lower()
+    if label_lower in {'true'}:
+        label = 1
+    elif label_lower in {'false'}:
+        label = 0
+    else:
+        raise ValueError(f"Unknown label: {sample['cred_label']}")
+    
+    adj_e_list = [evi['semantic']['adj_matrix'] for evi in graphs['evidences']]
+    
+    return {
+        'prepared_sample': prepared,
+        'adj_e_list': adj_e_list,
+        'label': label
+    }
+
 class FakeNewsDataset(Dataset):
-    """Dataset with preprocessing cache for faster training"""
+    """Dataset with parallel preprocessing and caching"""
     
-    def __init__(self, data_file: str, graph_constructor: GraphConstructor, 
-                 preprocessor: ESENDataPreprocessor):
-        with open(data_file, 'r') as f:
-            self.data = json.load(f)
+    def __init__(self, data_file: str, window_size: int = 3, 
+                 cache_dir: str = 'preprocessed_cache',
+                 stanza_cache_dir: str = 'stanza_cache',
+                 n_workers: int = None):
         
-        self.keys = list(self.data.keys())
-        self.true_labels = {'true'}
-        self.false_labels = {'false'}
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(stanza_cache_dir, exist_ok=True)
         
-        # Cache all preprocessed samples
-        print(f"Preprocessing {len(self.keys)} samples...")
-        self.samples = []
-        for key in tqdm(self.keys, desc="Caching"):
-            sample = self.data[key]
-            
-            # Process graph once
-            graphs = graph_constructor.process_claim_evidence(
-                claim=sample['claim_text'],
-                evidences=sample['evidences']
-            )
-            
-            prepared = preprocessor.prepare_sample(graphs)
-            label = self._get_binary_label(sample['cred_label'])
-            adj_e_list = [evi['semantic']['adj_matrix'] for evi in graphs['evidences']]
-            
-            self.samples.append({
-                'prepared_sample': prepared,
-                'adj_e_list': adj_e_list,
-                'label': label
-            })
-    
-    def _get_binary_label(self, cred_label: str) -> int:
-        """Convert 6-class label to binary"""
-        label_lower = cred_label.lower()
-        if label_lower in self.true_labels:
-            return 1
-        elif label_lower in self.false_labels:
-            return 0
+        # Cache path
+        cache_filename = os.path.basename(data_file).replace('.json', '_preprocessed.pkl')
+        self.cache_path = os.path.join(cache_dir, cache_filename)
+        
+        # Load from cache if exists
+        if os.path.exists(self.cache_path):
+            print(f"Loading preprocessed data from {self.cache_path}...")
+            with open(self.cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+                self.samples = cached_data['samples']
+                self.keys = cached_data['keys']
+            print(f"✓ Loaded {len(self.samples)} preprocessed samples")
         else:
-            raise ValueError(f"Unknown label: {cred_label}")
+            # Load raw data
+            with open(data_file, 'r') as f:
+                self.data = json.load(f)
+            
+            self.keys = list(self.data.keys())
+            
+            # Determine number of workers
+            if n_workers is None:
+                n_workers = min(cpu_count() - 1, 8)
+            
+            print(f"Preprocessing {len(self.keys)} samples with {n_workers} workers...")
+            
+            # Prepare arguments for parallel processing
+            args_list = [
+                (key, self.data[key], window_size, stanza_cache_dir)
+                for key in self.keys
+            ]
+            
+            # Parallel preprocessing
+            if n_workers > 1:
+                with Pool(n_workers) as pool:
+                    self.samples = list(tqdm(
+                        pool.imap(_process_sample, args_list),
+                        total=len(args_list),
+                        desc="Preprocessing"
+                    ))
+            else:
+                # Sequential fallback
+                self.samples = [_process_sample(args) for args in tqdm(args_list, desc="Preprocessing")]
+            
+            # Save cache
+            print(f"Saving preprocessed data to {self.cache_path}...")
+            with open(self.cache_path, 'wb') as f:
+                pickle.dump({'samples': self.samples, 'keys': self.keys}, f)
+            print("✓ Cache saved successfully")
     
     def __len__(self):
         return len(self.samples)
@@ -214,6 +265,9 @@ def main():
     patience = 10
     min_delta = 0.0001
     
+    # Preprocessing workers
+    n_workers = 8
+    
     fold_results = []
     
     for fold in range(1):
@@ -221,31 +275,36 @@ def main():
         print(f"Fold {fold}")
         print(f"{'='*60}")
         
-        # Initialize once per fold
-        graph_constructor = GraphConstructor(window_size=3)
-        preprocessor = ESENDataPreprocessor(embedding_dim=300)
-        
-        # Load datasets with caching
+        # Load datasets with parallel preprocessing and caching
         train_dataset = FakeNewsDataset(
             f'data/PolitiFact/json/5fold/train_{fold}.json',
-            graph_constructor, preprocessor
+            window_size=3,
+            cache_dir='preprocessed_cache',
+            stanza_cache_dir='stanza_cache',
+            n_workers=n_workers
         )
         dev_dataset = FakeNewsDataset(
             'data/PolitiFact/json/dev.json',
-            graph_constructor, preprocessor
+            window_size=3,
+            cache_dir='preprocessed_cache',
+            stanza_cache_dir='stanza_cache',
+            n_workers=n_workers
         )
         test_dataset = FakeNewsDataset(
             f'data/PolitiFact/json/5fold/test_{fold}.json',
-            graph_constructor, preprocessor
+            window_size=3,
+            cache_dir='preprocessed_cache',
+            stanza_cache_dir='stanza_cache',
+            n_workers=n_workers
         )
         
-        # DataLoaders with proper batching
+        # DataLoaders
         train_loader = DataLoader(
             train_dataset, 
             batch_size=32, 
             shuffle=True, 
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True if device.type == 'cuda' else False
         )
         dev_loader = DataLoader(
@@ -253,7 +312,7 @@ def main():
             batch_size=64, 
             shuffle=False, 
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True if device.type == 'cuda' else False
         )
         test_loader = DataLoader(
@@ -261,7 +320,7 @@ def main():
             batch_size=64, 
             shuffle=False, 
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=0,
             pin_memory=True if device.type == 'cuda' else False
         )
         
@@ -372,4 +431,6 @@ def main():
 if __name__ == "__main__":
     import os
     os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('preprocessed_cache', exist_ok=True)
+    os.makedirs('stanza_cache', exist_ok=True)
     main()
