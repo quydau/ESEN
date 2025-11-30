@@ -9,21 +9,18 @@ from models.graph_constructor import GraphConstructor
 import json
 from tqdm import tqdm
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
 import numpy as np
 
-# Detect device (CUDA hoặc MPS cho Mac)
 def get_device():
     if torch.cuda.is_available():
         return torch.device('cuda')
-    elif torch.backends.mps.is_available():  # Mac M1/M2
+    elif torch.backends.mps.is_available():
         return torch.device('mps')
     else:
         return torch.device('cpu')
 
 def move_batch_to_device(batch, device):
     """Recursively move batch tensors to device"""
-    
     def move_dict(d, device):
         result = {}
         for k, v in d.items():
@@ -52,16 +49,14 @@ class FakeNewsDataset(Dataset):
     """Dataset cho PolitiFact fake news detection"""
     
     def __init__(self, data_file: str, graph_constructor: GraphConstructor, 
-                 preprocessor: ESENDataPreprocessor, keys_subset=None):
+                 preprocessor: ESENDataPreprocessor):
         with open(data_file, 'r') as f:
             self.data = json.load(f)
         
-        # Allow subset of keys for train/val split
-        self.keys = keys_subset if keys_subset is not None else list(self.data.keys())
+        self.keys = list(self.data.keys())
         self.graph_constructor = graph_constructor
         self.preprocessor = preprocessor
         
-        # Label mapping
         self.true_labels = {'true'}
         self.false_labels = {'false'}
     
@@ -72,9 +67,9 @@ class FakeNewsDataset(Dataset):
         """Convert 6-class label to binary"""
         label_lower = cred_label.lower()
         if label_lower in self.true_labels:
-            return 1  # True
+            return 1
         elif label_lower in self.false_labels:
-            return 0  # Fake
+            return 0
         else:
             raise ValueError(f"Unknown label: {cred_label}")
     
@@ -82,23 +77,16 @@ class FakeNewsDataset(Dataset):
         key = self.keys[idx]
         sample = self.data[key]
         
-        # Build graphs
         graphs = self.graph_constructor.process_claim_evidence(
             claim=sample['claim_text'],
             evidences=sample['evidences']
         )
         
-        # Prepare tensors
         prepared = self.preprocessor.prepare_sample(graphs)
-        
-        # Binary label
         label = self._get_binary_label(sample['cred_label'])
         
-        # Publisher embeddings (TODO: implement real publisher encoder)
         P_c = torch.randn(100)
         P_e_list = [torch.randn(100) for _ in sample['evidences']]
-        
-        # Adjacency matrices
         adj_e_list = [evi['semantic']['adj_matrix'] for evi in graphs['evidences']]
         
         return {
@@ -109,7 +97,6 @@ class FakeNewsDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.long)
         }
 
-
 def train_epoch(model, dataloader, optimizer, device):
     model.train()
     total_loss = 0
@@ -117,35 +104,27 @@ def train_epoch(model, dataloader, optimizer, device):
     all_labels = []
     
     for batch in tqdm(dataloader, desc="Training"):
-        # Move to device
         batch = move_batch_to_device(batch, device)
         label = batch['label']
         
-        # Forward
         logits = model(batch)
-        
-        # Loss
         loss = compute_loss(logits, label)
         
-        # Backward
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
-        # Stats
         total_loss += loss.item()
         pred = torch.argmax(logits).cpu().item()
         all_preds.append(pred)
         all_labels.append(label.cpu().item())
     
-    # Calculate metrics
     avg_loss = total_loss / len(all_labels)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
     f1_macro = f1_score(all_labels, all_preds, average='macro')
     f1_micro = f1_score(all_labels, all_preds, average='micro')
     
     return avg_loss, accuracy, f1_macro, f1_micro
-
 
 def evaluate(model, dataloader, device):
     """Evaluate với classification report và F1 scores"""
@@ -167,7 +146,6 @@ def evaluate(model, dataloader, device):
             all_preds.append(pred)
             all_labels.append(label.cpu().item())
     
-    # Classification report
     report = classification_report(
         all_labels, all_preds,
         target_names=['Fake', 'True'],
@@ -181,10 +159,8 @@ def evaluate(model, dataloader, device):
         digits=4
     )
     
-    # Confusion matrix
     cm = confusion_matrix(all_labels, all_preds)
     
-    # Metrics
     avg_loss = total_loss / len(all_labels)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
     f1_macro = f1_score(all_labels, all_preds, average='macro')
@@ -200,19 +176,10 @@ def evaluate(model, dataloader, device):
         'cm': cm
     }
 
-
 def collate_fn(batch):
-    """
-    Custom collate vì mỗi sample có số evidence/nodes khác nhau.
-    Không thể stack thành batch → xử lý từng sample.
-    """
     if len(batch) == 1:
         return batch[0]
-    
-    # Nếu muốn batch > 1, cần pad/truncate (phức tạp)
-    # Đơn giản: return list
     return batch
-
 
 def main():
     device = get_device()
@@ -220,9 +187,8 @@ def main():
     
     # Early stopping config
     patience = 10
-    min_delta = 0.0001  # Minimum improvement to consider
+    min_delta = 0.0001
     
-    # Results storage
     fold_results = []
     
     for fold in range(1):
@@ -234,27 +200,14 @@ def main():
         graph_constructor = GraphConstructor(window_size=3)
         preprocessor = ESENDataPreprocessor(embedding_dim=300)
         
-        # Load training data and split into train/val (90/10)
-        with open(f'data/PolitiFact/json/5fold/train_{fold}.json', 'r') as f:
-            train_data = json.load(f)
-        
-        all_keys = list(train_data.keys())
-        train_keys, val_keys = train_test_split(
-            all_keys, 
-            test_size=0.1, 
-            random_state=42,
-            stratify=[train_data[k]['cred_label'].lower() for k in all_keys]
-        )
-        
+        # Load train, dev, test sets
         train_dataset = FakeNewsDataset(
             f'data/PolitiFact/json/5fold/train_{fold}.json',
-            graph_constructor, preprocessor,
-            keys_subset=train_keys
+            graph_constructor, preprocessor
         )
-        val_dataset = FakeNewsDataset(
-            f'data/PolitiFact/json/5fold/train_{fold}.json',
-            graph_constructor, preprocessor,
-            keys_subset=val_keys
+        dev_dataset = FakeNewsDataset(
+            'data/PolitiFact/json/dev.json',
+            graph_constructor, preprocessor
         )
         test_dataset = FakeNewsDataset(
             f'data/PolitiFact/json/5fold/test_{fold}.json',
@@ -262,10 +215,10 @@ def main():
         )
         
         train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
-        val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+        dev_loader = DataLoader(dev_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
         test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
         
-        print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}, Test size: {len(test_dataset)}")
+        print(f"Train: {len(train_dataset)}, Dev: {len(dev_dataset)}, Test: {len(test_dataset)}")
         
         # Model
         model = ESEN(
@@ -282,10 +235,9 @@ def main():
         optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.001)
         
         # Training with early stopping
-        best_val_f1 = 0
+        best_dev_f1 = 0
         best_epoch = 0
         patience_counter = 0
-        best_test_results = None
         
         for epoch in range(50):
             # Train
@@ -293,72 +245,64 @@ def main():
                 model, train_loader, optimizer, device
             )
             
-            # Validate
-            val_results = evaluate(model, val_loader, device)
+            # Evaluate on dev
+            dev_results = evaluate(model, dev_loader, device)
             
-            # Test (for tracking)
+            # Evaluate on test (for tracking)
             test_results = evaluate(model, test_loader, device)
             
             # Print progress every 5 epochs
             if (epoch + 1) % 5 == 0:
                 print(f"\nEpoch {epoch+1}:")
-                print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | F1-Macro: {train_f1_macro:.4f}")
-                print(f"Val   - Loss: {val_results['loss']:.4f} | Acc: {val_results['accuracy']:.4f} | F1-Macro: {val_results['f1_macro']:.4f}")
-                print(f"Test  - Loss: {test_results['loss']:.4f} | Acc: {test_results['accuracy']:.4f} | F1-Macro: {test_results['f1_macro']:.4f}")
+                print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | F1-Ma: {train_f1_macro:.4f}")
+                print(f"Dev   - Loss: {dev_results['loss']:.4f} | Acc: {dev_results['accuracy']:.4f} | F1-Ma: {dev_results['f1_macro']:.4f}")
+                print(f"Test  - Loss: {test_results['loss']:.4f} | Acc: {test_results['accuracy']:.4f} | F1-Ma: {test_results['f1_macro']:.4f}")
             
-            # Early stopping check based on validation F1-Macro
-            current_val_f1 = val_results['f1_macro']
+            # Early stopping check on dev F1-Macro
+            current_dev_f1 = dev_results['f1_macro']
             
-            if current_val_f1 > best_val_f1 + min_delta:
-                best_val_f1 = current_val_f1
+            if current_dev_f1 > best_dev_f1 + min_delta:
+                best_dev_f1 = current_dev_f1
                 best_epoch = epoch
                 patience_counter = 0
                 
-                # Save best model
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'val_f1': current_val_f1,
+                    'dev_f1': current_dev_f1,
                 }, f'checkpoints/esen_fold{fold}_best.pth')
                 
-                # Store best test results
-                best_test_results = test_results
-                
-                print(f"✓ New best Val F1-Macro: {best_val_f1:.4f} at epoch {epoch+1}")
+                print(f"✓ New best Dev F1-Macro: {best_dev_f1:.4f} at epoch {epoch+1}")
             else:
                 patience_counter += 1
                 
-            # Early stopping
             if patience_counter >= patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                print(f"Best Val F1-Macro: {best_val_f1:.4f} at epoch {best_epoch+1}")
+                print(f"\nEarly stopping at epoch {epoch+1}")
+                print(f"Best Dev F1-Macro: {best_dev_f1:.4f} at epoch {best_epoch+1}")
                 break
         
-        # Load best model for final evaluation
+        # Load best model
         checkpoint = torch.load(f'checkpoints/esen_fold{fold}_best.pth')
         model.load_state_dict(checkpoint['model_state_dict'])
         
         # Final test evaluation
         final_test_results = evaluate(model, test_loader, device)
         
-        # Print final results
         print(f"\n{'='*60}")
-        print(f"Fold {fold} - Best Results (Val F1-Macro: {best_val_f1:.4f})")
+        print(f"Fold {fold} - Best Results (Dev F1-Macro: {best_dev_f1:.4f})")
         print(f"{'='*60}")
         print(f"\nTest Performance:")
-        print(f"Accuracy: {final_test_results['accuracy']:.4f}")
-        print(f"F1-Macro: {final_test_results['f1_macro']:.4f}")
-        print(f"F1-Micro: {final_test_results['f1_micro']:.4f}")
-        print(f"\nClassification Report:")
-        print(final_test_results['report_str'])
-        print(f"\nConfusion Matrix:")
-        print(final_test_results['cm'])
+        print(f"Accuracy:  {final_test_results['accuracy']:.4f}")
+        print(f"F1-Macro:  {final_test_results['f1_macro']:.4f}")
+        print(f"F1-Micro:  {final_test_results['f1_micro']:.4f}")
+        print(f"\n{final_test_results['report_str']}")
+        print(f"\nConfusion Matrix:\n{final_test_results['cm']}")
         
         fold_results.append({
             'fold': fold,
             'best_epoch': best_epoch,
-            'val_f1_macro': best_val_f1,
+            'dev_f1_macro': best_dev_f1,
             'test_accuracy': final_test_results['accuracy'],
             'test_f1_macro': final_test_results['f1_macro'],
             'test_f1_micro': final_test_results['f1_micro'],
@@ -366,29 +310,21 @@ def main():
             'cm': final_test_results['cm']
         })
     
-    # Average across folds
+    # Summary
     print(f"\n{'='*60}")
     print("5-Fold Cross Validation Results")
     print(f"{'='*60}")
     
-    avg_test_acc = np.mean([r['test_accuracy'] for r in fold_results])
-    std_test_acc = np.std([r['test_accuracy'] for r in fold_results])
+    avg_acc = np.mean([r['test_accuracy'] for r in fold_results])
+    std_acc = np.std([r['test_accuracy'] for r in fold_results])
+    avg_f1_ma = np.mean([r['test_f1_macro'] for r in fold_results])
+    std_f1_ma = np.std([r['test_f1_macro'] for r in fold_results])
+    avg_f1_mi = np.mean([r['test_f1_micro'] for r in fold_results])
+    std_f1_mi = np.std([r['test_f1_micro'] for r in fold_results])
     
-    avg_test_f1_macro = np.mean([r['test_f1_macro'] for r in fold_results])
-    std_test_f1_macro = np.std([r['test_f1_macro'] for r in fold_results])
-    
-    avg_test_f1_micro = np.mean([r['test_f1_micro'] for r in fold_results])
-    std_test_f1_micro = np.std([r['test_f1_micro'] for r in fold_results])
-    
-    print(f"Test Accuracy:  {avg_test_acc:.4f} ± {std_test_acc:.4f}")
-    print(f"Test F1-Macro:  {avg_test_f1_macro:.4f} ± {std_test_f1_macro:.4f}")
-    print(f"Test F1-Micro:  {avg_test_f1_micro:.4f} ± {std_test_f1_micro:.4f}")
-    
-    for r in fold_results:
-        print(f"\nFold {r['fold']} (stopped at epoch {r['best_epoch']+1}):")
-        print(f"Val F1-Macro: {r['val_f1_macro']:.4f}")
-        print(f"Test F1-Macro: {r['test_f1_macro']:.4f}")
-
+    print(f"Test Accuracy:  {avg_acc:.4f} ± {std_acc:.4f}")
+    print(f"Test F1-Macro:  {avg_f1_ma:.4f} ± {std_f1_ma:.4f}")
+    print(f"Test F1-Micro:  {avg_f1_mi:.4f} ± {std_f1_mi:.4f}")
 
 if __name__ == "__main__":
     import os
