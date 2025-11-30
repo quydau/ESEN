@@ -46,7 +46,7 @@ def move_batch_to_device(batch, device):
     return move_dict(batch, device)
 
 class FakeNewsDataset(Dataset):
-    """Dataset cho PolitiFact fake news detection"""
+    """Dataset with preprocessing cache for faster training"""
     
     def __init__(self, data_file: str, graph_constructor: GraphConstructor, 
                  preprocessor: ESENDataPreprocessor):
@@ -54,14 +54,30 @@ class FakeNewsDataset(Dataset):
             self.data = json.load(f)
         
         self.keys = list(self.data.keys())
-        self.graph_constructor = graph_constructor
-        self.preprocessor = preprocessor
-        
         self.true_labels = {'true'}
         self.false_labels = {'false'}
-    
-    def __len__(self):
-        return len(self.keys)
+        
+        # Cache all preprocessed samples
+        print(f"Preprocessing {len(self.keys)} samples...")
+        self.samples = []
+        for key in tqdm(self.keys, desc="Caching"):
+            sample = self.data[key]
+            
+            # Process graph once
+            graphs = graph_constructor.process_claim_evidence(
+                claim=sample['claim_text'],
+                evidences=sample['evidences']
+            )
+            
+            prepared = preprocessor.prepare_sample(graphs)
+            label = self._get_binary_label(sample['cred_label'])
+            adj_e_list = [evi['semantic']['adj_matrix'] for evi in graphs['evidences']]
+            
+            self.samples.append({
+                'prepared_sample': prepared,
+                'adj_e_list': adj_e_list,
+                'label': label
+            })
     
     def _get_binary_label(self, cred_label: str) -> int:
         """Convert 6-class label to binary"""
@@ -73,29 +89,19 @@ class FakeNewsDataset(Dataset):
         else:
             raise ValueError(f"Unknown label: {cred_label}")
     
+    def __len__(self):
+        return len(self.samples)
+    
     def __getitem__(self, idx):
-        key = self.keys[idx]
-        sample = self.data[key]
-        
-        graphs = self.graph_constructor.process_claim_evidence(
-            claim=sample['claim_text'],
-            evidences=sample['evidences']
-        )
-        
-        prepared = self.preprocessor.prepare_sample(graphs)
-        label = self._get_binary_label(sample['cred_label'])
-        
-        P_c = torch.randn(100)
-        P_e_list = [torch.randn(100) for _ in sample['evidences']]
-        adj_e_list = [evi['semantic']['adj_matrix'] for evi in graphs['evidences']]
-        
-        return {
-            'prepared_sample': prepared,
-            'P_c': P_c,
-            'P_e_list': P_e_list,
-            'adj_e_list': adj_e_list,
-            'label': torch.tensor(label, dtype=torch.long)
-        }
+        return self.samples[idx]
+
+def collate_fn(batch):
+    """Proper batching collate function"""
+    return {
+        'prepared_sample': [b['prepared_sample'] for b in batch],
+        'adj_e_list': [b['adj_e_list'] for b in batch],
+        'label': torch.stack([torch.tensor(b['label'], dtype=torch.long) for b in batch])
+    }
 
 def train_epoch(model, dataloader, optimizer, device):
     model.train()
@@ -105,21 +111,33 @@ def train_epoch(model, dataloader, optimizer, device):
     
     for batch in tqdm(dataloader, desc="Training"):
         batch = move_batch_to_device(batch, device)
-        label = batch['label']
+        labels = batch['label']
         
-        logits = model(batch)
-        loss = compute_loss(logits, label)
+        # Forward pass for batch
+        logits_list = []
+        for i in range(len(batch['prepared_sample'])):
+            single_batch = {
+                'prepared_sample': batch['prepared_sample'][i],
+                'adj_e_list': batch['adj_e_list'][i],
+                'label': labels[i]
+            }
+            logits = model(single_batch)
+            logits_list.append(logits)
+        
+        # Stack logits and compute loss
+        logits_batch = torch.stack(logits_list)
+        loss = compute_loss(logits_batch, labels)
         
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
         total_loss += loss.item()
-        pred = torch.argmax(logits).cpu().item()
-        all_preds.append(pred)
-        all_labels.append(label.cpu().item())
+        preds = torch.argmax(logits_batch, dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_labels.extend(labels.cpu().numpy())
     
-    avg_loss = total_loss / len(all_labels)
+    avg_loss = total_loss / len(dataloader)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
     f1_macro = f1_score(all_labels, all_preds, average='macro')
     f1_micro = f1_score(all_labels, all_preds, average='micro')
@@ -127,7 +145,7 @@ def train_epoch(model, dataloader, optimizer, device):
     return avg_loss, accuracy, f1_macro, f1_micro
 
 def evaluate(model, dataloader, device):
-    """Evaluate với classification report và F1 scores"""
+    """Evaluate with classification report and F1 scores"""
     model.eval()
     all_preds = []
     all_labels = []
@@ -136,15 +154,27 @@ def evaluate(model, dataloader, device):
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
             batch = move_batch_to_device(batch, device)
-            label = batch['label']
-            logits = model(batch)
-            loss = compute_loss(logits, label)
+            labels = batch['label']
+            
+            # Forward pass for batch
+            logits_list = []
+            for i in range(len(batch['prepared_sample'])):
+                single_batch = {
+                    'prepared_sample': batch['prepared_sample'][i],
+                    'adj_e_list': batch['adj_e_list'][i],
+                    'label': labels[i]
+                }
+                logits = model(single_batch)
+                logits_list.append(logits)
+            
+            logits_batch = torch.stack(logits_list)
+            loss = compute_loss(logits_batch, labels)
             
             total_loss += loss.item()
-            pred = torch.argmax(logits).cpu().item()
+            preds = torch.argmax(logits_batch, dim=1).cpu().numpy()
             
-            all_preds.append(pred)
-            all_labels.append(label.cpu().item())
+            all_preds.extend(preds)
+            all_labels.extend(labels.cpu().numpy())
     
     report = classification_report(
         all_labels, all_preds,
@@ -161,7 +191,7 @@ def evaluate(model, dataloader, device):
     
     cm = confusion_matrix(all_labels, all_preds)
     
-    avg_loss = total_loss / len(all_labels)
+    avg_loss = total_loss / len(dataloader)
     accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
     f1_macro = f1_score(all_labels, all_preds, average='macro')
     f1_micro = f1_score(all_labels, all_preds, average='micro')
@@ -175,11 +205,6 @@ def evaluate(model, dataloader, device):
         'report_str': report_str,
         'cm': cm
     }
-
-def collate_fn(batch):
-    if len(batch) == 1:
-        return batch[0]
-    return batch
 
 def main():
     device = get_device()
@@ -196,11 +221,11 @@ def main():
         print(f"Fold {fold}")
         print(f"{'='*60}")
         
-        # Data
+        # Initialize once per fold
         graph_constructor = GraphConstructor(window_size=3)
         preprocessor = ESENDataPreprocessor(embedding_dim=300)
         
-        # Load train, dev, test sets
+        # Load datasets with caching
         train_dataset = FakeNewsDataset(
             f'data/PolitiFact/json/5fold/train_{fold}.json',
             graph_constructor, preprocessor
@@ -214,9 +239,31 @@ def main():
             graph_constructor, preprocessor
         )
         
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-        dev_loader = DataLoader(dev_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
-        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
+        # DataLoaders with proper batching
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=32, 
+            shuffle=True, 
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False
+        )
+        dev_loader = DataLoader(
+            dev_dataset, 
+            batch_size=64, 
+            shuffle=False, 
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False
+        )
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=64, 
+            shuffle=False, 
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True if device.type == 'cuda' else False
+        )
         
         print(f"Train: {len(train_dataset)}, Dev: {len(dev_dataset)}, Test: {len(test_dataset)}")
         
@@ -245,7 +292,7 @@ def main():
                 model, train_loader, optimizer, device
             )
             
-            # Evaluate on dev only
+            # Evaluate on dev
             dev_results = evaluate(model, dev_loader, device)
             
             # Print progress every 5 epochs
@@ -253,10 +300,8 @@ def main():
                 print(f"\nEpoch {epoch+1}:")
                 print(f"Train - Loss: {train_loss:.4f} | Acc: {train_acc:.4f} | F1-Ma: {train_f1_macro:.4f}")
                 print(f"Dev   - Loss: {dev_results['loss']:.4f} | Acc: {dev_results['accuracy']:.4f} | F1-Ma: {dev_results['f1_macro']:.4f}")
-                print("\nDev Classification Report:")
-                print(dev_results['report_str'])
             
-            # Early stopping check on dev F1-Macro
+            # Early stopping check
             current_dev_f1 = dev_results['f1_macro']
             
             if current_dev_f1 > best_dev_f1 + min_delta:
