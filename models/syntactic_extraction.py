@@ -225,23 +225,55 @@ class SyntacticEncoder(nn.Module):
         
         # Step 1: Multi-head attention tạo N weighted graphs
         # Ã^(1), ..., Ã^(N)
-        weighted_adjs = self.multi_head_attn(h)  # List of [num_nodes, num_nodes]
-        
-        # Step 2: Apply densely connected layer cho mỗi weighted graph
-        h_syn_list = []
-        for t in range(self.num_heads):
-            # h^(t)_syn từ mỗi weighted graph
-            h_t_syn = self.dense_layers[t](h, weighted_adjs[t])
-            h_syn_list.append(h_t_syn)
-        
-        # Step 3: Concatenate và linear combination
-        # h_out = [h^(1)_syn, ..., h^(N)_syn]
-        h_out = torch.cat(h_syn_list, dim=-1)  # [num_nodes, hidden_dim * N]
-        
-        # H_syn = W_syn * h_out + b_syn (công thức 6)
-        H_syn = self.linear_combination(h_out)  # [num_nodes, hidden_dim]
-        
-        return H_syn
+        # Support batched input: either [num_nodes, D] or [B, num_nodes, D]
+        if h.dim() == 3:
+            B, N, D = h.size()
+
+            # For multi-head attention and dense layers, process per-batch
+            weighted_adjs = []
+            for i in range(self.num_heads):
+                # Use the multi-head modules defined in MultiHeadAttentionGraph
+                Q = self.multi_head_attn.W_Q[i](h)  # [B, N, H]
+                K = self.multi_head_attn.W_K[i](h)  # [B, N, H]
+                scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.multi_head_attn.d_k)  # [B,N,N]
+                A_t = torch.softmax(scores, dim=-1)
+                weighted_adjs.append(A_t)
+
+            # Apply dense layers per head: each dense layer expects [N, H] and adj [N,N]
+            h_syn_list = []
+            for t in range(self.num_heads):
+                # For each batch, apply DenselyConnectedLayer separately and stack
+                h_t_list = []
+                adj_t = weighted_adjs[t]
+                for b in range(B):
+                    h_b = h[b]
+                    adj_b = adj_t[b]
+                    h_t_syn = self.dense_layers[t](h_b, adj_b)  # [N, H]
+                    h_t_list.append(h_t_syn)
+                h_t_stack = torch.stack(h_t_list, dim=0)  # [B, N, H]
+                h_syn_list.append(h_t_stack)
+
+            # Concatenate across heads on last dim
+            h_out = torch.cat(h_syn_list, dim=-1)  # [B, N, H * N_heads]
+            H_syn = self.linear_combination(h_out)  # [B, N, H]
+            return H_syn
+        else:
+            weighted_adjs = self.multi_head_attn(h)  # List of [num_nodes, num_nodes]
+
+            # Step 2: Apply densely connected layer cho mỗi weighted graph
+            h_syn_list = []
+            for t in range(self.num_heads):
+                # h^(t)_syn từ mỗi weighted graph
+                h_t_syn = self.dense_layers[t](h, weighted_adjs[t])
+                h_syn_list.append(h_t_syn)
+
+            # Step 3: Concatenate và linear combination
+            # h_out = [h^(1)_syn, ..., h^(N)_syn]
+            h_out = torch.cat(h_syn_list, dim=-1)  # [num_nodes, hidden_dim * N]
+
+            # H_syn = W_syn * h_out + b_syn (công thức 6)
+            H_syn = self.linear_combination(h_out)  # [num_nodes, hidden_dim]
+            return H_syn
 
 
 class SyntacticInformationExtraction(nn.Module):
@@ -281,21 +313,42 @@ class SyntacticInformationExtraction(nn.Module):
         """
         # Extract claim syntactic representation
         claim_data = prepared_sample['claim']['syntactic']
-        H_c_syn = self.syntactic_encoder(
-            claim_data['node_features'],
-            claim_data['adj_matrix']
-        )
-        
-        # Extract evidences syntactic representations
-        H_e_syn = []
-        for evi_data in prepared_sample['evidences']['syntactic']:
-            H_e = self.syntactic_encoder(
-                evi_data['node_features'],
-                evi_data['adj_matrix']
+
+        if claim_data['node_features'].dim() == 3:
+            # Batched: claim node_features [B, Nc, D], claim adj [B, Nc, Nc]
+            H_c_syn = self.syntactic_encoder(
+                claim_data['node_features'],
+                claim_data['adj_matrix']
+            )  # [B, Nc, H]
+
+            # Evidences: node_features [B, E, Ne, D] -> reshape to [B*E, Ne, D]
+            evi_data = prepared_sample['evidences']['syntactic']
+            B, E, Ne, D = evi_data['node_features'].size()
+            evi_nodes = evi_data['node_features'].reshape(B * E, Ne, D)
+            evi_adj = evi_data['adj_matrix'].reshape(B * E, Ne, Ne)
+
+            H_e = self.syntactic_encoder(evi_nodes, evi_adj)  # [B*E, Ne, H]
+            H_e = H_e.reshape(B, E, Ne, -1)  # [B, E, Ne, H]
+
+            return {
+                'H_c_syn': H_c_syn,
+                'H_e_syn': H_e
+            }
+        else:
+            H_c_syn = self.syntactic_encoder(
+                claim_data['node_features'],
+                claim_data['adj_matrix']
             )
-            H_e_syn.append(H_e)
-        
-        return {
-            'H_c_syn': H_c_syn,
-            'H_e_syn': H_e_syn
-        }
+
+            H_e_syn = []
+            for evi_data in prepared_sample['evidences']['syntactic']:
+                H_e = self.syntactic_encoder(
+                    evi_data['node_features'],
+                    evi_data['adj_matrix']
+                )
+                H_e_syn.append(H_e)
+
+            return {
+                'H_c_syn': H_c_syn,
+                'H_e_syn': H_e_syn
+            }

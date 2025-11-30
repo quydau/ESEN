@@ -53,37 +53,26 @@ class GGNN(nn.Module):
         Returns:
             H_sem: [num_nodes, hidden_dim] - Final semantic representation
         """
-        # Khởi tạo h_0
-        h_t = node_features  # [num_nodes, hidden_dim]
-        
-        # Propagation qua T steps
+        # Support both single-graph [N, H] and batched graphs [B, N, H]
+        h_t = node_features
+
+        batched = h_t.dim() == 3
+
         for t in range(self.num_steps):
-            # Bước 1: Aggregate thông tin từ neighbors
-            # a_t = Σ Ã * h_j * W_a
-            # [num_nodes, num_nodes] @ [num_nodes, hidden_dim] @ [hidden_dim, hidden_dim]
-            a_t = torch.matmul(adj_matrix, self.W_a(h_t))  # [num_nodes, hidden_dim]
-            
-            # Bước 2: Update gate
-            # z_t = σ(W_z * a_t + U_z * h_t + b_z)
-            z_t = torch.sigmoid(
-                self.W_z(a_t) + self.U_z(h_t) + self.b_z
-            )  # [num_nodes, hidden_dim]
-            
-            # Bước 3: Reset gate
-            # r_t = σ(W_r * a_t + U_r * h_t + b_r)
-            r_t = torch.sigmoid(
-                self.W_r(a_t) + self.U_r(h_t) + self.b_r
-            )  # [num_nodes, hidden_dim]
-            
-            # Bước 4: Candidate activation
-            # l_t = tanh(W_h * a_t + U_h * (r_t ⊙ h_t) + b_h)
-            l_t = torch.tanh(
-                self.W_h(a_t) + self.U_h(r_t * h_t) + self.b_h
-            )  # [num_nodes, hidden_dim]
-            
-            # Bước 5: Update node representation (GRU-style)
-            # H_t = l_t ⊙ z_t + h_t ⊙ (1 - z_t)
-            h_t = l_t * z_t + h_t * (1 - z_t)  # [num_nodes, hidden_dim]
-        
-        # Return final representation
-        return h_t  # H_sem
+            # Aggregate neighbor info: works for both batched and single
+            # If batched: adj_matrix [B,N,N], self.W_a(h_t) -> [B,N,H]
+            a_t = torch.matmul(adj_matrix, self.W_a(h_t))
+
+            # Update gate
+            z_t = torch.sigmoid(self.W_z(a_t) + self.U_z(h_t) + self.b_z)
+
+            # Reset gate
+            r_t = torch.sigmoid(self.W_r(a_t) + self.U_r(h_t) + self.b_r)
+
+            # Candidate activation
+            l_t = torch.tanh(self.W_h(a_t) + self.U_h(r_t * h_t) + self.b_h)
+
+            # Update
+            h_t = l_t * z_t + h_t * (1 - z_t)
+
+        return h_t

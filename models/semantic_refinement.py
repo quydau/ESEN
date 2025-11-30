@@ -46,7 +46,8 @@ class SemanticRefinement(nn.Module):
         Returns:
             score1: [num_nodes, 1] - Self-redundancy scores
         """
-        score1 = self.W_score1(H_e)  # [num_nodes, 1]
+        # Supports H_e: [num_nodes, hidden_dim] or [B, num_nodes, hidden_dim]
+        score1 = self.W_score1(H_e)  # [..., num_nodes, 1] or [num_nodes,1]
         return score1
     
     def compute_claim_relevance_redundancy(self, 
@@ -68,24 +69,22 @@ class SemanticRefinement(nn.Module):
         """
         # W_ij = relevance between evidence node i and claim node j
         # [num_evi_nodes, hidden_dim] @ [hidden_dim, num_claim_nodes]
-        W = torch.matmul(H_e, H_c.transpose(0, 1))  # [num_evi_nodes, num_claim_nodes]
-        
-        # Normalize
-        W = torch.softmax(W, dim=-1)  # [num_evi_nodes, num_claim_nodes]
-        
-        # Σ_j W_ij · H_cj (weighted sum of claim features)
-        # [num_evi_nodes, num_claim_nodes] @ [num_claim_nodes, hidden_dim]
-        weighted_claim = torch.matmul(W, H_c)  # [num_evi_nodes, hidden_dim]
-        
-        # Sum over hidden_dim
-        relevance_sum = torch.sum(weighted_claim, dim=-1, keepdim=True)  # [num_evi_nodes, 1]
-        
-        # score_i^2 = -log(relevance_sum)
-        # High relevance → low score → KEEP
-        # Low relevance → high score → DISCARD
-        score2 = -torch.log(relevance_sum + 1e-10)
-        
-        return score2
+        # Support batched inputs: H_e [num_evi_nodes, H] or [B, num_evi_nodes, H]
+        if H_e.dim() == 3:
+            # H_e: [B, Ne, H], H_c: [B, Nc, H]
+            W = torch.matmul(H_e, H_c.transpose(-2, -1))  # [B, Ne, Nc]
+            W = torch.softmax(W, dim=-1)
+            weighted_claim = torch.matmul(W, H_c)  # [B, Ne, H]
+            relevance_sum = torch.sum(weighted_claim, dim=-1, keepdim=True)  # [B, Ne, 1]
+            score2 = -torch.log(relevance_sum + 1e-10)
+            return score2
+        else:
+            W = torch.matmul(H_e, H_c.transpose(0, 1))  # [Ne, Nc]
+            W = torch.softmax(W, dim=-1)
+            weighted_claim = torch.matmul(W, H_c)  # [Ne, H]
+            relevance_sum = torch.sum(weighted_claim, dim=-1, keepdim=True)  # [Ne,1]
+            score2 = -torch.log(relevance_sum + 1e-10)
+            return score2
     
     def combine_scores(self, 
                        score1: torch.Tensor, 
@@ -116,7 +115,8 @@ class SemanticRefinement(nn.Module):
         Returns:
             S: [num_nodes, 1] - Evidence-aware redundancy scores
         """
-        S = self.ggnn(score, adj_matrix)  # [num_nodes, 1]
+        # GGNN supports batched score and adj
+        S = self.ggnn(score, adj_matrix)  # [..., num_nodes, 1]
         return S
     
     def forward(self, 
@@ -135,37 +135,45 @@ class SemanticRefinement(nn.Module):
             H_e_refined: [num_remaining_nodes, hidden_dim] - Refined evidence
             keep_mask: [num_nodes] - Boolean mask of kept nodes
         """
-        num_nodes = H_e.size(0)
-        
-        # Step 1: Compute self-redundancy (công thức 11)
-        score1 = self.compute_self_redundancy(H_e)
-        
-        # Step 2: Compute claim-relevance redundancy (công thức 12)
-        score2 = self.compute_claim_relevance_redundancy(H_e, H_c)
-        
-        # Step 3: Combine scores (công thức 13)
-        score = self.combine_scores(score1, score2)
-        
-        # Step 4: GGNN refinement (công thức 14)
-        S = self.refine_with_ggnn(score, adj_e)
-        
-        # Step 5: Sort và discard top k highest redundancy nodes
-        k = int(self.top_k_ratio * num_nodes)
-        
-        # Get indices sorted by redundancy (ascending: low redundancy first)
-        sorted_indices = torch.argsort(S.squeeze(), descending=False)
-        
-        # Keep nodes with lowest redundancy (discard top k)
-        keep_indices = sorted_indices[:-k] if k > 0 else sorted_indices
-        
-        # Create boolean mask
-        keep_mask = torch.zeros(num_nodes, dtype=torch.bool, device=H_e.device)
-        keep_mask[keep_indices] = True
-        
-        # Filter evidence representations
-        H_e_refined = H_e[keep_mask]  # [num_remaining_nodes, hidden_dim]
-        
-        return H_e_refined, keep_mask
+        # Support batched and single inputs
+        if H_e.dim() == 3:
+            # H_e: [B, Ne, H], H_c: [B, Nc, H], adj_e: [B, Ne, Ne]
+            B, Ne, H = H_e.size()
+
+            score1 = self.compute_self_redundancy(H_e)  # [B, Ne, 1]
+            score2 = self.compute_claim_relevance_redundancy(H_e, H_c)  # [B, Ne, 1]
+            score = self.combine_scores(score1, score2)  # [B, Ne, 1]
+
+            S = self.refine_with_ggnn(score, adj_e)  # [B, Ne, 1]
+
+            k = (self.top_k_ratio * Ne).long().item() if isinstance(self.top_k_ratio, torch.Tensor) else int(self.top_k_ratio * Ne)
+
+            H_e_refined_list = []
+            keep_masks = []
+            for b in range(B):
+                S_b = S[b].squeeze(-1)  # [Ne]
+                sorted_indices = torch.argsort(S_b, descending=False)
+                keep_indices = sorted_indices[:-k] if k > 0 else sorted_indices
+                keep_mask = torch.zeros(Ne, dtype=torch.bool, device=H_e.device)
+                keep_mask[keep_indices] = True
+                keep_masks.append(keep_mask)
+                H_e_refined_list.append(H_e[b][keep_mask])
+
+            return H_e_refined_list, keep_masks
+        else:
+            num_nodes = H_e.size(0)
+            score1 = self.compute_self_redundancy(H_e)
+            score2 = self.compute_claim_relevance_redundancy(H_e, H_c)
+            score = self.combine_scores(score1, score2)
+            S = self.refine_with_ggnn(score, adj_e)
+
+            k = int(self.top_k_ratio * num_nodes)
+            sorted_indices = torch.argsort(S.squeeze(), descending=False)
+            keep_indices = sorted_indices[:-k] if k > 0 else sorted_indices
+            keep_mask = torch.zeros(num_nodes, dtype=torch.bool, device=H_e.device)
+            keep_mask[keep_indices] = True
+            H_e_refined = H_e[keep_mask]
+            return H_e_refined, keep_mask
 
 
 class SemanticRefinementWrapper(nn.Module):
@@ -202,15 +210,50 @@ class SemanticRefinementWrapper(nn.Module):
                 'keep_masks': List of boolean masks
             }
         """
-        H_e_refined_list = []
-        keep_masks = []
-        
-        for H_e, adj_e in zip(H_e_list, adj_e_list):
-            H_e_ref, mask = self.refinement(H_e, H_c, adj_e)
-            H_e_refined_list.append(H_e_ref)
-            keep_masks.append(mask)
-        
-        return {
-            'H_e_refined': H_e_refined_list,
-            'keep_masks': keep_masks
-        }
+        # Support batched inputs: H_c [B, Nc, H], H_e_list: [B, E, Ne, H], adj_e_list: [B, E, Ne, Ne]
+        if isinstance(H_e_list, dict):
+            # Expect dict with 'node_features' and 'adj_matrix'
+            evi_nodes = H_e_list['node_features']  # [B, E, Ne, H]
+            evi_adj = H_e_list['adj_matrix']      # [B, E, Ne, Ne]
+
+            B, E, Ne, H = evi_nodes.size()
+            H_e_refined = []
+            keep_masks = []
+
+            for b in range(B):
+                H_e_refined_b = []
+                keep_masks_b = []
+                for e in range(E):
+                    H_e = evi_nodes[b, e]
+                    adj_e = evi_adj[b, e]
+                    H_e_ref, mask = self.refinement(H_e, H_c[b], adj_e)
+                    H_e_refined_b.append(H_e_ref)
+                    keep_masks_b.append(mask)
+                H_e_refined.append(H_e_refined_b)
+                keep_masks.append(keep_masks_b)
+
+            return {'H_e_refined': H_e_refined, 'keep_masks': keep_masks}
+        elif isinstance(H_e_list, torch.Tensor):
+            # H_e_list: [B, E, Ne, H]
+            B, E, Ne, H = H_e_list.size()
+            H_e_refined = []
+            keep_masks = []
+            for b in range(B):
+                H_e_refined_b = []
+                keep_masks_b = []
+                for e in range(E):
+                    H_e_ref, mask = self.refinement(H_e_list[b, e], H_c[b], adj_e_list[b, e])
+                    H_e_refined_b.append(H_e_ref)
+                    keep_masks_b.append(mask)
+                H_e_refined.append(H_e_refined_b)
+                keep_masks.append(keep_masks_b)
+
+            return {'H_e_refined': H_e_refined, 'keep_masks': keep_masks}
+        else:
+            H_e_refined_list = []
+            keep_masks = []
+            for H_e, adj_e in zip(H_e_list, adj_e_list):
+                H_e_ref, mask = self.refinement(H_e, H_c, adj_e)
+                H_e_refined_list.append(H_e_ref)
+                keep_masks.append(mask)
+            return {'H_e_refined': H_e_refined_list, 'keep_masks': keep_masks}

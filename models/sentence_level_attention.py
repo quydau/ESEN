@@ -49,37 +49,55 @@ class SentenceLevelAttention(nn.Module):
             H_r_e: [hidden_dim] - Weighted evidence representation
             H_final: [hidden_dim * 2 + publisher_dim] - Final representation [h_c; H_r_e]
         """
-        n = H_T_e.size(0)  # Số evidences
-        
-        # Tính h_c = [h_t_c; P_c]
-        # h_t_c: average của claim nodes (như công thức 15)
-        h_t_c = torch.mean(H_c, dim=0)  # [hidden_dim]
-        
-        if P_c is not None:
-            h_c = torch.cat([h_t_c, P_c], dim=0)  # [hidden_dim + publisher_dim]
+        # Support batched H_T_e: [B, n, hidden] and H_c: [B, Nc, hidden]
+        if H_T_e.dim() == 3:
+            B, n, hidden = H_T_e.size()
+
+            # h_t_c: average of claim nodes per batch -> [B, hidden]
+            h_t_c = torch.mean(H_c, dim=1)  # [B, hidden]
+
+            if P_c is not None:
+                # P_c: [B, publisher_dim]
+                h_c = torch.cat([h_t_c, P_c], dim=-1)  # [B, hidden + pub]
+            else:
+                h_c = h_t_c
+
+            # Expand h_c to [B, n, dim]
+            h_c_expanded = h_c.unsqueeze(1).expand(-1, n, -1)  # [B, n, d]
+
+            concat_input = torch.cat([H_T_e, h_c_expanded], dim=-1)  # [B, n, *]
+            p_q = torch.tanh(self.W_c(concat_input))  # [B, n, hidden]
+
+            scores = self.W_s(p_q).squeeze(-1)  # [B, n]
+            a_q = torch.softmax(scores, dim=-1)  # [B, n]
+
+            a_q_expanded = a_q.unsqueeze(-1)  # [B, n, 1]
+            H_r_e = torch.sum(a_q_expanded * H_T_e, dim=1)  # [B, hidden]
+
+            H_final = torch.cat([h_c, H_r_e], dim=-1)  # [B, 2*hidden + pub]
+
+            return H_r_e, H_final
         else:
-            h_c = h_t_c  # [hidden_dim]
-        
-        # Expand h_c để concat với mỗi evidence
-        h_c_expanded = h_c.unsqueeze(0).expand(n, -1)  # [n, hidden_dim + publisher_dim]
-        
-        # Công thức (23): p_q = tanh([H_q_e; h_c] * W_c)
-        concat_input = torch.cat([H_T_e, h_c_expanded], dim=-1)  # [n, 2*hidden_dim + publisher_dim]
-        p_q = torch.tanh(self.W_c(concat_input))  # [n, hidden_dim]
-        
-        # Công thức (24): a_q = exp(p_q * W_s) / Σ exp(p_j * W_s)
-        scores = self.W_s(p_q)  # [n, 1]
-        scores = scores.squeeze(-1)  # [n]
-        a_q = torch.softmax(scores, dim=0)  # [n]
-        
-        # Công thức (25): H_r_e = Σ a_q * H_q_e
-        a_q_expanded = a_q.unsqueeze(-1)  # [n, 1]
-        H_r_e = torch.sum(a_q_expanded * H_T_e, dim=0)  # [hidden_dim]
-        
-        # Final representation: H_final = [h_c; H_r_e]
-        H_final = torch.cat([h_c, H_r_e], dim=0)  # [2*hidden_dim + publisher_dim]
-        
-        return H_r_e, H_final
+            n = H_T_e.size(0)
+            h_t_c = torch.mean(H_c, dim=0)
+
+            if P_c is not None:
+                h_c = torch.cat([h_t_c, P_c], dim=0)
+            else:
+                h_c = h_t_c
+
+            h_c_expanded = h_c.unsqueeze(0).expand(n, -1)
+            concat_input = torch.cat([H_T_e, h_c_expanded], dim=-1)
+            p_q = torch.tanh(self.W_c(concat_input))
+
+            scores = self.W_s(p_q).squeeze(-1)
+            a_q = torch.softmax(scores, dim=0)
+
+            a_q_expanded = a_q.unsqueeze(-1)
+            H_r_e = torch.sum(a_q_expanded * H_T_e, dim=0)
+
+            H_final = torch.cat([h_c, H_r_e], dim=0)
+            return H_r_e, H_final
 
 
 class InformationInteractionNetwork(nn.Module):
@@ -131,14 +149,13 @@ class InformationInteractionNetwork(nn.Module):
         """
         # Step 1: Word-level attention
         h_e_list = self.word_attention(H_c, H_e_list, P_e_list)
-        # → (h_e1, ..., h_en), mỗi h_e: [hidden_dim + publisher_dim]
-        
+        # h_e_list: either list [E, hidden] for single sample or tensor [B, E, hidden]
+
         # Step 2: Evidence-level attention
         H_T_e = self.evidence_attention(h_e_list)
-        # → [n, hidden_dim + publisher_dim]
-        
+        # H_T_e: [n, hidden] or [B, n, hidden]
+
         # Step 3: Sentence-level attention
         H_r_e, H_final = self.sentence_attention(H_T_e, H_c, P_c)
-        # → H_final: [2*hidden_dim + publisher_dim]
-        
+
         return H_final

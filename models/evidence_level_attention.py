@@ -37,35 +37,40 @@ class EvidenceLevelAttention(nn.Module):
         Returns:
             h_e_updated: [n, hidden_dim] - Updated evidence representations
         """
-        n = len(h_e_list)
-        
-        # Stack thành tensor để xử lý
-        # h^(t-1): [n, hidden_dim]
-        h_prev = torch.stack(h_e_list, dim=0)
-        
-        # Tính attention coefficients cho tất cả cặp (i, j)
-        # p_ij cho mọi i, j
-        
-        # Expand để tạo tất cả các cặp
-        h_i = h_prev.unsqueeze(1).expand(n, n, self.hidden_dim)  # [n, n, hidden_dim]
-        h_j = h_prev.unsqueeze(0).expand(n, n, self.hidden_dim)  # [n, n, hidden_dim]
-        
-        # Công thức (19): p_ij = W_1(ReLU(W_0([h_ei; h_ej])))
-        concat_ij = torch.cat([h_i, h_j], dim=-1)  # [n, n, 2*hidden_dim]
-        
-        # MLP
-        hidden = torch.relu(self.W_0(concat_ij))  # [n, n, hidden_dim]
-        p_ij = self.W_1(hidden).squeeze(-1)  # [n, n]
-        
-        # Công thức (20): a_ij = softmax(p_ij)
-        # Normalize theo dimension j (neighbors của node i)
-        a_ij = torch.softmax(p_ij, dim=-1)  # [n, n]
-        
-        # Công thức (21): h^t_ei = Σ_j a_ij * h^(t-1)_ej
-        # Aggregation: [n, n] @ [n, hidden_dim] = [n, hidden_dim]
-        h_updated = torch.matmul(a_ij, h_prev)  # [n, hidden_dim]
-        
-        return h_updated
+        # Accept either list [n, H] or tensor [n, H] or batched tensor [B, n, H]
+        if isinstance(h_e_list, list):
+            h_prev = torch.stack(h_e_list, dim=0)
+        else:
+            h_prev = h_e_list
+
+        if h_prev.dim() == 3:
+            # Batched: [B, n, H]
+            B, n, H = h_prev.size()
+
+            # h_i: [B, n, n, H], h_j same
+            h_i = h_prev.unsqueeze(2).expand(-1, -1, n, -1)
+            h_j = h_prev.unsqueeze(1).expand(-1, n, -1, -1)
+
+            concat_ij = torch.cat([h_i, h_j], dim=-1)  # [B, n, n, 2H]
+            hidden = torch.relu(self.W_0(concat_ij))  # [B, n, n, H]
+            p_ij = self.W_1(hidden).squeeze(-1)  # [B, n, n]
+
+            a_ij = torch.softmax(p_ij, dim=-1)  # [B, n, n]
+
+            # Batch matmul: a_ij [B, n, n] @ h_prev [B, n, H] -> [B, n, H]
+            h_updated = torch.matmul(a_ij, h_prev)
+            return h_updated
+        else:
+            # [n, H]
+            n = h_prev.size(0)
+            h_i = h_prev.unsqueeze(1).expand(n, n, self.hidden_dim)
+            h_j = h_prev.unsqueeze(0).expand(n, n, self.hidden_dim)
+            concat_ij = torch.cat([h_i, h_j], dim=-1)
+            hidden = torch.relu(self.W_0(concat_ij))
+            p_ij = self.W_1(hidden).squeeze(-1)
+            a_ij = torch.softmax(p_ij, dim=-1)
+            h_updated = torch.matmul(a_ij, h_prev)
+            return h_updated
 
 
 class EvidenceLevelAttentionStack(nn.Module):
@@ -101,19 +106,22 @@ class EvidenceLevelAttentionStack(nn.Module):
         Returns:
             H_T_e: [n, hidden_dim] - Final evidence representations (công thức 22)
         """
-        # Convert list sang tensor
-        h_t = torch.stack(h_e_list, dim=0)  # [n, hidden_dim]
-        
-        # Propagate qua T layers
+        # Accept list of tensors or tensor [n, H] or batched [B, n, H]
+        if isinstance(h_e_list, list):
+            h_t = torch.stack(h_e_list, dim=0)
+        else:
+            h_t = h_e_list
+
+        # Propagate through layers
         for t, layer in enumerate(self.attention_layers):
-            # Convert tensor về list cho layer
-            h_list = [h_t[i] for i in range(h_t.size(0))]
-            
-            # Apply attention layer
-            h_t = layer(h_list)  # [n, hidden_dim]
-        
-        # Công thức (22): H^T_e = [h^T_e1; ...; h^T_en]
-        # Đã có dạng [n, hidden_dim], mỗi row là một h^T_ei
+            if h_t.dim() == 3:
+                # Batched [B, n, H]
+                B, n, H = h_t.size()
+                h_t = layer(h_t)  # layer handles batched
+            else:
+                # [n, H], layer expects list or tensor
+                h_list = [h_t[i] for i in range(h_t.size(0))]
+                h_t = layer(h_list)
+
         H_T_e = h_t
-        
         return H_T_e

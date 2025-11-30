@@ -46,20 +46,33 @@ class SemanticSyntacticFusion(nn.Module):
             H_enhanced: [num_nodes, hidden_dim] - Enhanced semantic representation (H'_sem)
         """
         # Công thức (7): α_syn = softmax(FFN([H_syn; H_sem]))
-        concat_input = torch.cat([H_syn, H_sem], dim=-1)  # [num_nodes, 2*hidden_dim]
-        alpha_syn = self.ffn(concat_input)  # [num_nodes, hidden_dim]
-        
-        # Công thức (8): M = α_syn ⊙ H_syn (element-wise multiplication)
-        M = alpha_syn * H_syn  # [num_nodes, hidden_dim]
-        
-        # Công thức (9): f = σ(W_sem · [H_sem; M] + b_sem)
-        concat_sem_M = torch.cat([H_sem, M], dim=-1)  # [num_nodes, 2*hidden_dim]
-        f = torch.sigmoid(self.gate_linear(concat_sem_M))  # [num_nodes, hidden_dim]
-        
-        # Công thức (10): H'_sem = f ⊙ H_sem + (1 - f) ⊙ M
-        H_enhanced = f * H_sem + (1 - f) * M  # [num_nodes, hidden_dim]
-        
-        return H_enhanced
+        # Support batched inputs: either [num_nodes, H] or [B, num_nodes, H]
+        if H_sem.dim() == 3:
+            # [B, N, H]
+            concat_input = torch.cat([H_syn, H_sem], dim=-1)  # [B, N, 2*H]
+            alpha_syn = self.ffn(concat_input)  # [B, N, H]
+            M = alpha_syn * H_syn  # [B, N, H]
+
+            concat_sem_M = torch.cat([H_sem, M], dim=-1)  # [B, N, 2*H]
+            f = torch.sigmoid(self.gate_linear(concat_sem_M))  # [B, N, H]
+
+            H_enhanced = f * H_sem + (1 - f) * M  # [B, N, H]
+            return H_enhanced
+        else:
+            concat_input = torch.cat([H_syn, H_sem], dim=-1)  # [num_nodes, 2*hidden_dim]
+            alpha_syn = self.ffn(concat_input)  # [num_nodes, hidden_dim]
+
+            # Công thức (8): M = α_syn ⊙ H_syn (element-wise multiplication)
+            M = alpha_syn * H_syn  # [num_nodes, hidden_dim]
+
+            # Công thức (9): f = σ(W_sem · [H_sem; M] + b_sem)
+            concat_sem_M = torch.cat([H_sem, M], dim=-1)  # [num_nodes, 2*hidden_dim]
+            f = torch.sigmoid(self.gate_linear(concat_sem_M))  # [num_nodes, hidden_dim]
+
+            # Công thức (10): H'_sem = f ⊙ H_sem + (1 - f) ⊙ M
+            H_enhanced = f * H_sem + (1 - f) * M  # [num_nodes, hidden_dim]
+
+            return H_enhanced
 
 
 class SemanticEnhancementNetwork(nn.Module):
@@ -117,23 +130,38 @@ class SemanticEnhancementNetwork(nn.Module):
         # Step 1: Extract semantic representations
         semantic_outputs = self.semantic_extractor(prepared_sample)
         H_c_sem = semantic_outputs['H_c_sem']
-        H_e_sem_list = semantic_outputs['H_e_sem']
-        
+        H_e_sem = semantic_outputs['H_e_sem']
+
         # Step 2: Extract syntactic representations
         syntactic_outputs = self.syntactic_extractor(prepared_sample)
         H_c_syn = syntactic_outputs['H_c_syn']
-        H_e_syn_list = syntactic_outputs['H_e_syn']
-        
-        # Step 3: Fuse semantic and syntactic for claim
-        H_c = self.fusion(H_c_sem, H_c_syn)
-        
-        # Step 4: Fuse semantic and syntactic for each evidence
-        H_e_list = []
-        for H_e_sem, H_e_syn in zip(H_e_sem_list, H_e_syn_list):
-            H_e = self.fusion(H_e_sem, H_e_syn)
-            H_e_list.append(H_e)
-        
-        return {
-            'H_c': H_c,        # Enhanced claim representation
-            'H_e': H_e_list    # Enhanced evidence representations
-        }
+        H_e_syn = syntactic_outputs['H_e_syn']
+
+        # If batched, H_c_sem: [B, Nc, H], H_e_sem: [B, E, Ne, H]
+        if isinstance(H_c_sem, torch.Tensor) and H_c_sem.dim() == 3:
+            # Fuse claim representations
+            H_c = self.fusion(H_c_sem, H_c_syn)  # [B, Nc, H]
+
+            # For evidences, reshape [B, E, Ne, H] -> [B*E, Ne, H]
+            B, E, Ne, H = H_e_sem.size()
+            H_e_sem_flat = H_e_sem.reshape(B * E, Ne, H)
+            H_e_syn_flat = H_e_syn.reshape(B * E, Ne, H)
+
+            H_e_fused_flat = self.fusion(H_e_sem_flat, H_e_syn_flat)  # [B*E, Ne, H]
+            H_e_fused = H_e_fused_flat.reshape(B, E, Ne, H)
+
+            return {
+                'H_c': H_c,
+                'H_e': H_e_fused
+            }
+        else:
+            H_c = self.fusion(H_c_sem, H_c_syn)
+            H_e_list = []
+            for H_e_sem_item, H_e_syn_item in zip(H_e_sem, H_e_syn):
+                H_e = self.fusion(H_e_sem_item, H_e_syn_item)
+                H_e_list.append(H_e)
+
+            return {
+                'H_c': H_c,
+                'H_e': H_e_list
+            }

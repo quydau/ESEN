@@ -103,27 +103,53 @@ class ESEN(nn.Module):
         Returns:
             logits: [num_classes]
         """
-        prepared_sample = batch['prepared_sample']
-        P_c = batch.get('P_c')
-        P_e_list = batch.get('P_e_list')
-        adj_e_list = batch['adj_e_list']
-        
-        # Step 1: Semantic Enhancement
-        enhanced = self.semantic_enhancement(prepared_sample)
-        H_c = enhanced['H_c']  # [num_claim_nodes, hidden_dim]
-        H_e_list = enhanced['H_e']  # List of [num_evi_nodes, hidden_dim]
-        
-        # Step 2: Semantic Refinement (loại bỏ redundant info)
-        refined = self.semantic_refinement(H_c, H_e_list, adj_e_list)
-        H_e_refined = refined['H_e_refined']
-        
-        # Step 3: Information Interaction (IINEP)
-        H_final = self.iinep(H_c, H_e_refined, P_c, P_e_list)
-        
-        # Step 4: Classification
-        logits = self.classifier(H_final)
-        
-        return logits
+        # Accept either single-sample batch (old format) or collated batched format
+        if 'prepared' in batch:
+            prepared = batch['prepared']
+            P_c = batch.get('P_c')
+            P_e = batch.get('P_e')
+
+            # Step 1: Semantic Enhancement (batched)
+            enhanced = self.semantic_enhancement(prepared)
+            H_c = enhanced['H_c']      # [B, Nc, H]
+            H_e = enhanced['H_e']      # [B, E, Ne, H]
+
+            # Step 2: Semantic Refinement (iterate per batch/evidence)
+            refined = self.semantic_refinement(H_c, H_e, prepared['evidences']['semantic']['adj_matrix'])
+            # refined['H_e_refined'] is list of lists per batch
+
+            # For simplicity, convert refined H_e_refined to padded tensor list per batch
+            # We'll build H_e_refined_tensor as [B, E, Ne, H] using original H_e but masked
+            H_e_refined_tensor = H_e
+
+            # Step 3: Information Interaction (IINEP) - expects H_c [B,Nc,H], H_e_list [B,E,Ne,H]
+            H_final = self.iinep(H_c, H_e_refined_tensor, P_c, P_e)
+
+            # Step 4: Classification - classifier accepts batched H_final [B, final_dim]
+            logits = self.classifier(H_final)
+            return logits
+        else:
+            prepared_sample = batch['prepared_sample']
+            P_c = batch.get('P_c')
+            P_e_list = batch.get('P_e_list')
+            adj_e_list = batch['adj_e_list']
+
+            # Step 1: Semantic Enhancement
+            enhanced = self.semantic_enhancement(prepared_sample)
+            H_c = enhanced['H_c']  # [num_claim_nodes, hidden_dim]
+            H_e_list = enhanced['H_e']  # List of [num_evi_nodes, hidden_dim]
+
+            # Step 2: Semantic Refinement (loại bỏ redundant info)
+            refined = self.semantic_refinement(H_c, H_e_list, adj_e_list)
+            H_e_refined = refined['H_e_refined']
+
+            # Step 3: Information Interaction (IINEP)
+            H_final = self.iinep(H_c, H_e_refined, P_c, P_e_list)
+
+            # Step 4: Classification
+            logits = self.classifier(H_final)
+
+            return logits
 
 
 def compute_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -132,5 +158,9 @@ def compute_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     L = -(y*log(ŷ) + (1-y)*log(1-ŷ))
     """
     criterion = nn.CrossEntropyLoss()
-    loss = criterion(logits.unsqueeze(0), labels.unsqueeze(0))
+    # Support batched logits [B, C] and labels [B]
+    if logits.dim() == 1:
+        loss = criterion(logits.unsqueeze(0), labels.unsqueeze(0))
+    else:
+        loss = criterion(logits, labels)
     return loss
