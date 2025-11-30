@@ -214,9 +214,9 @@ def main():
             graph_constructor, preprocessor
         )
         
-        train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True, collate_fn=collate_fn)
-        dev_loader = DataLoader(dev_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+        dev_loader = DataLoader(dev_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
+        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, collate_fn=collate_fn)
         
         print(f"Train: {len(train_dataset)}, Dev: {len(dev_dataset)}, Test: {len(test_dataset)}")
         
